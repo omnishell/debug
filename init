@@ -1,0 +1,420 @@
+#! /bin/bash
+
+__debug__() {
+    __debug__.__help__() {
+        echo """ABOUT:
+    omni operating system debugger
+USAGE:
+    debug <module> <command> [args]
+MODULES:
+    process    Process inspection and management
+    log        System log inspection
+    system     System metrics and state
+PROCESS COMMANDS:
+    ls   [-m|--mem [<val>]] [-c|--cpu [<val>]] [-l|--limit|--l <N>]
+    get  [-m|--mem [<val>]] [-c|--cpu [<val>]] [-l|--limit|--l <N>]
+    kill [<entry>] [-m|--mem <val>] [-c|--cpu <val>] [-l|--limit|--l <N>]""" >&2
+    }
+
+    __debug__.process._parse_mem() {
+        local val="${1^^}"
+        local num="${val%[KMG]}"
+        [[ -z "$num" || -n "${num//[0-9]/}" ]] && return 1
+        case "$val" in
+            *G) REPLY=$(( 10#$num * 1048576 )) ;;
+            *M) REPLY=$(( 10#$num * 1024 )) ;;
+            *K) REPLY=$(( 10#$num )) ;;
+            *)  REPLY=$(( 10#$num )) ;;
+        esac
+    }
+
+    __debug__.process._query() {
+        local sort_by="$1" min_mem_kb="$2" min_cpu_x10="$3" limit="$4" order="${5:-desc}"
+        REPLY_PIDS=()
+        REPLY_LINES=()
+
+        local up_str _
+        read -r up_str _ < /proc/uptime
+        local up_sec="${up_str%.*}"
+        local up_ ticks=$(( 10#$up_sec * 100 ))
+
+        local line page_kb=4
+        while read -r line; do
+            if [[ "$line" == "KernelPageSize:"* ]]; then
+                line="${line#KernelPageSize:}"
+                line="${line%%kB*}"
+                page_kb="${line// /}"
+                break
+            fi
+        done < /proc/self/smaps 2>/dev/null
+        [[ -z "$page_kb" || -n "${page_kb//[0-9]/}" ]] && page_kb=4
+
+        local -a keys=() pids=() lines=()
+        local p stat_line pid comm rest
+        local -a f=()
+
+        for p in /proc/[0-9]*; do
+            [[ -r "$p/stat" ]] || continue
+            IFS= read -r stat_line < "$p/stat" 2>/dev/null || continue
+            pid="${stat_line%% *}"
+            comm="${stat_line#* (}"
+            rest="${comm##*) }"
+            comm="${comm%) *}"
+
+            read -ra f <<< "$rest"
+            local utime="${f[11]:-0}"
+            local stime="${f[12]:-0}"
+            local starttime="${f[19]:-0}"
+            local rss="${f[21]:-0}"
+
+            local mem_kb=$(( rss * page_kb ))
+            local total_time=$(( utime + stime ))
+            local elapsed=$(( up_ticks - starttime ))
+            (( elapsed <= 0 )) && elapsed=1
+            local cpu_x10=$(( (total_time * 1000) / elapsed ))
+
+            (( min_mem_kb > 0 && mem_kb < min_mem_kb )) && continue
+            (( min_cpu_x10 > 0 && cpu_x10 < min_cpu_x10 )) && continue
+
+            local key=$pid
+            if [[ "$sort_by" == "mem" ]]; then
+                key=$mem_kb
+            elif [[ "$sort_by" == "cpu" ]]; then
+                key=$cpu_x10
+            fi
+
+            local cpu_int=$(( cpu_x10 / 10 ))
+            local cpu_frac=$(( cpu_x10 % 10 ))
+            local fmt_line
+            printf -v fmt_line "%-8s %-20s %8d KB %6d.%d%%" "$pid" "${comm:0:20}" "$mem_kb" "$cpu_int" "$cpu_frac"
+
+            keys+=("$key")
+            pids+=("$pid")
+            lines+=("$fmt_line")
+        done
+
+        local n=${#pids[@]}
+        local i j k_val p_val l_val
+        if [[ "$sort_by" == "mem" || "$sort_by" == "cpu" ]]; then
+            for (( i=1; i<n; i++ )); do
+                k_val=${keys[i]}
+                p_val=${pids[i]}
+                l_val="${lines[i]}"
+                j=$(( i - 1 ))
+                while (( j >= 0 && keys[j] < k_val )); do
+                    keys[j+1]=${keys[j]}
+                    pids[j+1]=${pids[j]}
+                    lines[j+1]="${lines[j]}"
+                    (( j-- ))
+                done
+                keys[j+1]=$k_val
+                pids[j+1]=$p_val
+                lines[j+1]="$l_val"
+            done
+        elif [[ "$order" == "desc" ]]; then
+            for (( i=1; i<n; i++ )); do
+                k_val=${keys[i]}
+                p_val=${pids[i]}
+                l_val="${lines[i]}"
+                j=$(( i - 1 ))
+                while (( j >= 0 && keys[j] < k_val )); do
+                    keys[j+1]=${keys[j]}
+                    pids[j+1]=${pids[j]}
+                    lines[j+1]="${lines[j]}"
+                    (( j-- ))
+                done
+                keys[j+1]=$k_val
+                pids[j+1]=$p_val
+                lines[j+1]="$l_val"
+            done
+        fi
+
+        local count=$n
+        (( limit > 0 && limit < n )) && count=$limit
+
+        for (( i=0; i<count; i++ )); do
+            REPLY_PIDS+=("${pids[i]}")
+            REPLY_LINES+=("${lines[i]}")
+        done
+    }
+
+    __debug__.process.ls() {
+        local sort_by="" min_mem=0 min_cpu=0 limit=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -l|--l|--limit) limit="$2"; shift 2 ;;
+                --limit=*|--l=*|-l=*) limit="${1#*=}"; shift ;;
+                -m|--mem)
+                    sort_by="mem"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        __debug__.process._parse_mem "$2" && min_mem=$REPLY
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --mem=*|-m=*)
+                    sort_by="mem"
+                    __debug__.process._parse_mem "${1#*=}" && min_mem=$REPLY
+                    shift
+                    ;;
+                -c|--cpu)
+                    sort_by="cpu"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        local c_val="${2%\%}"
+                        local c_int="${c_val%.*}" c_frac=0
+                        [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                        min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --cpu=*|-c=*)
+                    sort_by="cpu"
+                    local c_val="${1#*=}"; c_val="${c_val%\%}"
+                    local c_int="${c_val%.*}" c_frac=0
+                    [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                    min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                    shift
+                    ;;
+                *) shift ;;
+            esac
+        done
+
+        local -a REPLY_PIDS=() REPLY_LINES=()
+        __debug__.process._query "$sort_by" "$min_mem" "$min_cpu" "$limit" "asc"
+        printf "%-8s %-20s %11s %8s\n" "PID" "COMMAND" "MEM" "CPU"
+        local line
+        for line in "${REPLY_LINES[@]}"; do
+            printf "%s\n" "$line"
+        done
+    }
+
+    __debug__.process.get() {
+        local sort_by="" min_mem=0 min_cpu=0 limit=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -l|--l|--limit) limit="$2"; shift 2 ;;
+                --limit=*|--l=*|-l=*) limit="${1#*=}"; shift ;;
+                -m|--mem)
+                    sort_by="mem"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        __debug__.process._parse_mem "$2" && min_mem=$REPLY
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --mem=*|-m=*)
+                    sort_by="mem"
+                    __debug__.process._parse_mem "${1#*=}" && min_mem=$REPLY
+                    shift
+                    ;;
+                -c|--cpu)
+                    sort_by="cpu"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        local c_val="${2%\%}"
+                        local c_int="${c_val%.*}" c_frac=0
+                        [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                        min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --cpu=*|-c=*)
+                    sort_by="cpu"
+                    local c_val="${1#*=}"; c_val="${c_val%\%}"
+                    local c_int="${c_val%.*}" c_frac=0
+                    [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                    min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                    shift
+                    ;;
+                *) shift ;;
+            esac
+        done
+
+        local -a REPLY_PIDS=() REPLY_LINES=()
+        __debug__.process._query "$sort_by" "$min_mem" "$min_cpu" "$limit" "asc"
+        printf "%s\n" "${REPLY_PIDS[*]}"
+    }
+
+    __debug__.process.kill() {
+        local sort_by="" min_mem=0 min_cpu=0 limit=0 target=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -l|--l|--limit) limit="$2"; shift 2 ;;
+                --limit=*|--l=*|-l=*) limit="${1#*=}"; shift ;;
+                -m|--mem)
+                    sort_by="mem"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        __debug__.process._parse_mem "$2" && min_mem=$REPLY
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --mem=*|-m=*)
+                    sort_by="mem"
+                    __debug__.process._parse_mem "${1#*=}" && min_mem=$REPLY
+                    shift
+                    ;;
+                -c|--cpu)
+                    sort_by="cpu"
+                    if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                        local c_val="${2%\%}"
+                        local c_int="${c_val%.*}" c_frac=0
+                        [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                        min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                        shift 2
+                    else
+                        shift
+                    fi
+                    ;;
+                --cpu=*|-c=*)
+                    sort_by="cpu"
+                    local c_val="${1#*=}"; c_val="${c_val%\%}"
+                    local c_int="${c_val%.*}" c_frac=0
+                    [[ "$c_val" == *.* ]] && c_frac="${c_val#*.}" && c_frac="${c_frac:0:1}"
+                    min_cpu=$(( 10#${c_int:-0} * 10 + 10#${c_frac:-0} ))
+                    shift
+                    ;;
+                *) [[ -z "$target" ]] && target="$1"; shift ;;
+            esac
+        done
+
+        if [[ -n "$target" ]]; then
+            if [[ -z "${target//[0-9]/}" ]]; then
+                builtin kill -9 "$target" 2>/dev/null
+            else
+                local p comm_val
+                for p in /proc/[0-9]*; do
+                    [[ -r "$p/comm" ]] || continue
+                    IFS= read -r comm_val < "$p/comm" 2>/dev/null || continue
+                    if [[ "$comm_val" == "$target" ]]; then
+                        builtin kill -9 "${p#/proc/}" 2>/dev/null
+                    fi
+                done
+            fi
+            return 0
+        fi
+
+        local -a REPLY_PIDS=() REPLY_LINES=()
+        __debug__.process._query "$sort_by" "$min_mem" "$min_cpu" "$limit" "desc"
+        if (( ${#REPLY_PIDS[@]} > 0 )); then
+            builtin kill -9 "${REPLY_PIDS[@]}" 2>/dev/null
+        fi
+    }
+
+    __debug__.process() {
+        local cmd="$1"
+        shift || true
+        case "$cmd" in
+            ls)   __debug__.process.ls "$@" ;;
+            get)  __debug__.process.get "$@" ;;
+            kill) __debug__.process.kill "$@" ;;
+            *)    __log "Unknown process command '$cmd'" -t error -l debug; return 1 ;;
+        esac
+    }
+
+    __debug__.log() {
+        local cmd="${1:-ls}"
+        shift || true
+        local limit=50
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -l|--l|--limit) limit="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        local log_file=""
+        for f in /var/log/syslog /var/log/messages /var/log/kern.log; do
+            [[ -r "$f" ]] && { log_file="$f"; break; }
+        done
+        [[ -z "$log_file" ]] && return 1
+        local -a lines=()
+        mapfile -t lines < "$log_file" 2>/dev/null
+        local total=${#lines[@]}
+        local start=$(( total > limit ? total - limit : 0 ))
+        local i
+        for (( i=start; i<total; i++ )); do
+            printf "%s\n" "${lines[i]}"
+        done
+    }
+
+    __debug__.system() {
+        local cmd="${1:-info}"
+        local line
+        case "$cmd" in
+            mem)
+                while IFS= read -r line; do
+                    printf "%s\n" "$line"
+                done < /proc/meminfo
+                ;;
+            cpu)
+                while IFS= read -r line; do
+                    printf "%s\n" "$line"
+                done < /proc/cpuinfo
+                ;;
+            *)
+                local up _ load
+                read -r up _ < /proc/uptime
+                read -r load < /proc/loadavg
+                printf "Uptime: %ss\nLoad:   %s\n" "$up" "$load"
+                ;;
+        esac
+    }
+
+    debug() {
+        local cmd="$1"
+        if [[ -z "$cmd" || "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+            __debug__.__help__
+            return 0
+        fi
+        shift
+        case "$cmd" in
+            process) __debug__.process "$@" ;;
+            log)     __debug__.log "$@" ;;
+            system)  __debug__.system "$@" ;;
+            *)       __log "Unknown command '$cmd'" -t error -l debug; return 1 ;;
+        esac
+    }
+
+    __debug__.__compl__() {
+        local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
+        local base_cmd="${COMP_WORDS[1]:-}" sub_cmd="${COMP_WORDS[2]:-}"
+
+        if [[ $COMP_CWORD -eq 1 ]]; then
+            COMPREPLY=( $(compgen -W "process log system --help -h" -- "$cur") )
+            return 0
+        fi
+
+        case "$base_cmd" in
+            process)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls get kill" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-l --l --limit -m --mem -c --cpu" -- "$cur") )
+                    return 0
+                fi
+                ;;
+            log)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-l --l --limit" -- "$cur") )
+                fi
+                ;;
+            system)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "info mem cpu" -- "$cur") )
+                fi
+                ;;
+        esac
+    }
+
+    __debug__.__init__() {
+        __compl debug
+    }
+}
